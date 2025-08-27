@@ -233,6 +233,7 @@ func main() {
                 log.Printf("Failed to verify JWT: %v", err)
                 return e.UnauthorizedError("Invalid token", nil)
             }
+            log.Printf("JWT: %v", token)
 
             // Extract claims from verified token
             if claims, ok := token.Claims.(jwt.MapClaims); ok {
