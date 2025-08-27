@@ -1,6 +1,7 @@
 package main
 
 import (
+    "bytes"
     "crypto/ecdsa"
     "crypto/elliptic"
     "encoding/base64"
@@ -13,6 +14,7 @@ import (
     "strings"
     "sync"
     "time"
+    "regexp"
 
     "github.com/golang-jwt/jwt/v5"
     "github.com/joho/godotenv"
@@ -48,6 +50,21 @@ type JWKSCache struct {
 }
 
 var jwksCache = &JWKSCache{}
+
+// RefreshTokenRequest represents the refresh token request payload
+type RefreshTokenRequest struct {
+    RefreshToken string `json:"refresh_token"`
+}
+
+// RefreshTokenResponse represents the refresh token response
+type RefreshTokenResponse struct {
+    AccessToken  string `json:"access_token"`
+    TokenType    string `json:"token_type"`
+    ExpiresIn    int    `json:"expires_in"`
+    ExpiresAt    int64  `json:"expires_at"`
+    RefreshToken string `json:"refresh_token"`
+    User         interface{} `json:"user"`
+}
 
 // fetchJWKS fetches JWKS from the given URL with caching
 func fetchJWKS(jwksUrl string) (*JWKS, error) {
@@ -175,6 +192,105 @@ func verifyJWT(tokenString string, jwks *JWKS) (*jwt.Token, error) {
     return token, nil
 }
 
+// refreshAccessToken refreshes the access token using the refresh token
+func refreshAccessToken(refreshToken, supabaseProjectId string) (*RefreshTokenResponse, error) {
+    refreshUrl := fmt.Sprintf("https://%s.supabase.co/auth/v1/token?grant_type=refresh_token", supabaseProjectId)
+    
+    reqBody := RefreshTokenRequest{
+        RefreshToken: refreshToken,
+    }
+    
+    jsonBody, err := json.Marshal(reqBody)
+    if err != nil {
+        return nil, fmt.Errorf("failed to marshal request: %v", err)
+    }
+    
+    client := &http.Client{
+        Timeout: 10 * time.Second,
+    }
+    
+    req, err := http.NewRequest("POST", refreshUrl, bytes.NewBuffer(jsonBody))
+    if err != nil {
+        return nil, fmt.Errorf("failed to create request: %v", err)
+    }
+    
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("apikey", os.Getenv("SUPABASE_ANON_KEY"))
+    
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("failed to refresh token: %v", err)
+    }
+    defer resp.Body.Close()
+    
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("refresh token endpoint returned status: %d", resp.StatusCode)
+    }
+    
+    var refreshResp RefreshTokenResponse
+    if err := json.NewDecoder(resp.Body).Decode(&refreshResp); err != nil {
+        return nil, fmt.Errorf("failed to decode refresh response: %v", err)
+    }
+    
+    return &refreshResp, nil
+}
+
+// updateAuthCookie updates the auth cookie with new token data
+func updateAuthCookie(e *core.RequestEvent, newTokenData map[string]interface{}, authTokenName string) error {
+    // Encode the new token data to JSON and then base64
+    jsonData, err := json.Marshal(newTokenData)
+    if err != nil {
+        return fmt.Errorf("failed to marshal new token data: %v", err)
+    }
+    
+    encodedData := base64.StdEncoding.EncodeToString(jsonData)
+    cookieValue := "base64-" + encodedData
+    
+    // Set the new cookie
+    cookie := &http.Cookie{
+        Name:     authTokenName,
+        Value:    cookieValue,
+        Path:     "/",
+        HttpOnly: true,
+        Secure:   true, // Set to false for development if using HTTP
+        SameSite: http.SameSiteLaxMode,
+    }
+    
+    e.Response.Header().Set("Set-Cookie", cookie.String())
+    return nil
+}
+
+// upsertPBUser finds or creates a pocketbase auth record with supabase_id
+func upsertPBUser(app *pocketbase.PocketBase, supabaseId, email string) (*core.Record, error) {
+    dao := app.Dao()
+    // attempt to find by supabase_id
+    filter := fmt.Sprintf("supabase_id = '%s'", supabaseId)
+    records, err := dao.FindRecordsByExpr("users", filter, nil)
+    if err == nil && len(records) > 0 {
+        return records[0], nil
+    }
+
+    // not found -> create
+    col, err := dao.FindCollectionByNameOrId("users")
+    if err != nil {
+        return nil, fmt.Errorf("users collection not found: %w", err)
+    }
+
+    rec := core.NewRecord(col)
+    rec.Set("supabase_id", supabaseId)
+    if email != "" {
+        rec.SetEmail(email)
+        rec.SetVerified(true)
+    }
+    // set a random password so PB treats it as an auth record
+    rec.SetRandomPassword()
+
+    if err := dao.SaveRecord(rec); err != nil {
+        return nil, fmt.Errorf("failed to save user: %w", err)
+    }
+    return rec, nil
+}
+
 func main() {
     err := godotenv.Load()
     if err != nil {
@@ -184,8 +300,27 @@ func main() {
     app := pocketbase.New()
 
     app.OnServe().BindFunc(func(se *core.ServeEvent) error {
+        // example route to test
+        se.Router.GET("/whoami", func(e *core.RequestEvent) error {
+            if r := e.Get("pb_auth_record"); r != nil {
+                rec := r.(*core.Record)
+                return e.JSON(http.StatusOK, map[string]interface{}{
+                    "pb_user_id": rec.Id,
+                    "email":      rec.Email(),
+                })
+            }
+            return e.JSON(http.StatusOK, map[string]interface{}{"authed": false})
+        })
+
         // register a global middleware
         se.Router.BindFunc(func(e *core.RequestEvent) error {
+            // Allow admin UI paths or assets to bypass (optional)
+            var adminPathRegex = regexp.MustCompile(`^/_(/.*)?$`)
+            p := e.Request.URL.Path
+            if adminPathRegex.MatchString(p) {
+                return e.Next()
+            }
+
             supabaseProjectId := os.Getenv("SUPABASE_PROJECT_ID")
             jwksUrl := fmt.Sprintf("https://%s.supabase.co/auth/v1/.well-known/jwks.json", supabaseProjectId)
             authTokenName := fmt.Sprintf("sb-%s-auth-token", supabaseProjectId)
@@ -231,23 +366,60 @@ func main() {
             token, err := verifyJWT(accessToken, jwks)
             if err != nil {
                 log.Printf("Failed to verify JWT: %v", err)
-                return e.UnauthorizedError("Invalid token", nil)
+                
+                // Check if we have a refresh token to try refreshing
+                if refreshToken, ok := tokenData["refresh_token"].(string); ok && refreshToken != "" {
+                    log.Printf("Attempting to refresh access token...")
+                    
+                    refreshResp, refreshErr := refreshAccessToken(refreshToken, supabaseProjectId)
+                    if refreshErr != nil {
+                        log.Printf("Failed to refresh token: %v", refreshErr)
+                        return e.UnauthorizedError("Token refresh failed", nil)
+                    }
+                    
+                    // Update token data with new values
+                    tokenData["access_token"] = refreshResp.AccessToken
+                    tokenData["refresh_token"] = refreshResp.RefreshToken
+                    tokenData["expires_at"] = refreshResp.ExpiresAt
+                    tokenData["user"] = refreshResp.User
+                    
+                    // Update the cookie with new token data
+                    if err := updateAuthCookie(e, tokenData, authTokenName); err != nil {
+                        log.Printf("Failed to update auth cookie: %v", err)
+                    }
+                    
+                    // Try verifying the new access token
+                    token, err = verifyJWT(refreshResp.AccessToken, jwks)
+                    if err != nil {
+                        log.Printf("Failed to verify refreshed JWT: %v", err)
+                        return e.UnauthorizedError("Invalid refreshed token", nil)
+                    }
+                    
+                    log.Printf("Successfully refreshed and verified token")
+                } else {
+                    return e.UnauthorizedError("Invalid token and no refresh token available", nil)
+                }
             }
 
             // Extract claims from verified token
-            if claims, ok := token.Claims.(jwt.MapClaims); ok {
-                log.Printf("Token verified successfully!")
-                log.Printf("User ID: %v", claims["sub"])
-                log.Printf("Email: %v", claims["email"])
-                log.Printf("Expires at: %v", time.Unix(int64(claims["exp"].(float64)), 0))
-                
-                // Store verified claims in request context
-                e.Set("jwt_claims", claims)
-                e.Set("user_id", claims["sub"])
-                e.Set("user_email", claims["email"])
+            claims, ok := token.Claims.(jwt.MapClaims)
+            if !ok {
+                log.Printf("Failed to extract claims from token")
+                return e.UnauthorizedError("Invalid token claims", nil)
             }
 
-            e.Set("jwks", jwks)
+            // Extract id and email
+            rec, err := upsertPBUser(app, claims["sub"].(string), claims["email"].(string))
+            if err != nil {
+                log.Printf("Failed to upsert PocketBase user: %v", err)
+                return e.InternalServerError("Failed to upsert user", nil)
+            }
+
+            // attach auth to the request context so PB handlers see it
+            // context key used by pocketbase for auth is "auth" in RequestEvent; here we set on echo context
+            // set the pb auth record and claims for downstream handlers
+            e.Set("pb_auth_record", rec)
+            e.Set("pb_auth_claims", claims)
 
             return e.Next()
         })
