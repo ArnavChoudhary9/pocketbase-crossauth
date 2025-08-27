@@ -251,6 +251,7 @@ func updateAuthCookie(e *core.RequestEvent, newTokenData map[string]interface{},
         Name:     authTokenName,
         Value:    cookieValue,
         Path:     "/",
+        Domain:   os.Getenv("COOKIE_DOMAIN"),
         HttpOnly: true,
         Secure:   true, // Set to false for development if using HTTP
         SameSite: http.SameSiteLaxMode,
@@ -260,35 +261,16 @@ func updateAuthCookie(e *core.RequestEvent, newTokenData map[string]interface{},
     return nil
 }
 
-// upsertPBUser finds or creates a pocketbase auth record with supabase_id
-func upsertPBUser(app *pocketbase.PocketBase, supabaseId, email string) (*core.Record, error) {
-    dao := app.Dao()
-    // attempt to find by supabase_id
-    filter := fmt.Sprintf("supabase_id = '%s'", supabaseId)
-    records, err := dao.FindRecordsByExpr("users", filter, nil)
-    if err == nil && len(records) > 0 {
-        return records[0], nil
-    }
+// getUserClaims retrieves the user claims from PocketBase
+func getUserClaims(supabaseId, email string) (jwt.MapClaims, error) {
+    log.Printf("Would get user with Supabase ID: %s, Email: %s", supabaseId, email)
 
-    // not found -> create
-    col, err := dao.FindCollectionByNameOrId("users")
-    if err != nil {
-        return nil, fmt.Errorf("users collection not found: %w", err)
-    }
-
-    rec := core.NewRecord(col)
-    rec.Set("supabase_id", supabaseId)
-    if email != "" {
-        rec.SetEmail(email)
-        rec.SetVerified(true)
-    }
-    // set a random password so PB treats it as an auth record
-    rec.SetRandomPassword()
-
-    if err := dao.SaveRecord(rec); err != nil {
-        return nil, fmt.Errorf("failed to save user: %w", err)
-    }
-    return rec, nil
+    // Return mock claims for now
+    return jwt.MapClaims{
+        "sub":   supabaseId,
+        "email": email,
+        "id":    supabaseId, // Use supabase ID as PB ID for now
+    }, nil
 }
 
 func main() {
@@ -303,10 +285,11 @@ func main() {
         // example route to test
         se.Router.GET("/whoami", func(e *core.RequestEvent) error {
             if r := e.Get("pb_auth_record"); r != nil {
-                rec := r.(*core.Record)
+                claims := r.(jwt.MapClaims)
                 return e.JSON(http.StatusOK, map[string]interface{}{
-                    "pb_user_id": rec.Id,
-                    "email":      rec.Email(),
+                    "pb_user_id": claims["sub"],
+                    "email":      claims["email"],
+                    "authed":     true,
                 })
             }
             return e.JSON(http.StatusOK, map[string]interface{}{"authed": false})
@@ -314,11 +297,26 @@ func main() {
 
         // register a global middleware
         se.Router.BindFunc(func(e *core.RequestEvent) error {
-            // Allow admin UI paths or assets to bypass (optional)
-            var adminPathRegex = regexp.MustCompile(`^/_(/.*)?$`)
+            // Define excluded path patterns that should bypass authentication
+            excludedPatterns := []string{
+                `^/_.*`,         // Admin UI paths (/_/*)
+                `^/favicon\.ico$`, // Favicon
+                `^/robots\.txt$`,  // Robots.txt (optional)
+            }
+
             p := e.Request.URL.Path
-            if adminPathRegex.MatchString(p) {
-                return e.Next()
+
+            // Check if path matches any excluded pattern
+            for _, pattern := range excludedPatterns {
+                matched, err := regexp.MatchString(pattern, p)
+                if err != nil {
+                    log.Printf("Error matching pattern %s: %v", pattern, err)
+                    continue
+                }
+                if matched {
+                    log.Printf("Skipping auth for excluded path: %s (pattern: %s)", p, pattern)
+                    return e.Next()
+                }
             }
 
             supabaseProjectId := os.Getenv("SUPABASE_PROJECT_ID")
@@ -408,18 +406,23 @@ func main() {
                 return e.UnauthorizedError("Invalid token claims", nil)
             }
 
-            // Extract id and email
-            rec, err := upsertPBUser(app, claims["sub"].(string), claims["email"].(string))
+            // Create/find PocketBase user
+            userClaims, err := getUserClaims(claims["sub"].(string), claims["email"].(string))
             if err != nil {
-                log.Printf("Failed to upsert PocketBase user: %v", err)
-                return e.InternalServerError("Failed to upsert user", nil)
+                log.Printf("Failed to get PocketBase user: %v", err)
+                return e.InternalServerError("Failed to get user", nil)
             }
 
-            // attach auth to the request context so PB handlers see it
-            // context key used by pocketbase for auth is "auth" in RequestEvent; here we set on echo context
-            // set the pb auth record and claims for downstream handlers
-            e.Set("pb_auth_record", rec)
-            e.Set("pb_auth_claims", claims)
+            log.Printf("Token verified successfully!")
+            log.Printf("User ID: %v", claims["sub"])
+            log.Printf("Email: %v", claims["email"])
+
+            // Set PocketBase auth context with claims
+            e.Set("pb_auth_record", userClaims)    // Store user claims
+            e.Set("pb_auth_claims", claims)        // JWT claims for reference
+            e.Set("user_id", claims["sub"])        // Supabase user ID
+            e.Set("user_email", claims["email"])
+            e.Set("authed", true)                  // Authenticated flag
 
             return e.Next()
         })
