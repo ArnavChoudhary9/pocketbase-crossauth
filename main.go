@@ -148,7 +148,7 @@ func main() {
             }
 
             // Create/find PocketBase user
-            userClaims, err := getUserClaims(claims["sub"].(string), claims["email"].(string))
+            pbUser, err := getPBUser(app, claims["sub"].(string), claims["email"].(string))
             if err != nil {
                 log.Printf("Failed to get PocketBase user: %v", err)
                 return e.InternalServerError("Failed to get user", nil)
@@ -159,11 +159,12 @@ func main() {
             log.Printf("Email: %v", claims["email"])
 
             // Set PocketBase auth context with claims
-            e.Set("pb_auth_record", userClaims)    // Store user claims
-            e.Set("pb_auth_claims", claims)        // JWT claims for reference
-            e.Set("user_id", claims["sub"])        // Supabase user ID
+            e.Set("pb_auth_record", pbUser)       // Store user claims
+            e.Set("pb_auth_claims", claims)       // JWT claims for reference
+            e.Set("user_id", claims["sub"])       // Supabase user ID
             e.Set("user_email", claims["email"])
-            e.Set("authed", true)                  // Authenticated flag
+            e.Set("pb_user_id", pbUser.Id)        // PocketBase user ID
+            e.Set("authed", true)                 // Authenticated flag
 
             return e.Next()
         })
