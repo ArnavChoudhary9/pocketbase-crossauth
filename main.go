@@ -24,17 +24,43 @@ func main() {
     app := pocketbase.New()
 
     app.OnServe().BindFunc(func(se *core.ServeEvent) error {
+        // Supabase auth endpoint
+        se.Router.POST("/auth", func(e *core.RequestEvent) error {
+            return handleSupabaseAuth(e, app)
+        })
+
         // example route to test
         se.Router.GET("/whoami", func(e *core.RequestEvent) error {
-            if r := e.Get("pb_auth_record"); r != nil {
-                claims := r.(jwt.MapClaims)
+            if authed := e.Get("authed"); authed != nil && authed.(bool) {
+                pbUser := e.Get("pb_auth_record").(*core.Record)
+                claims := e.Get("pb_auth_claims").(jwt.MapClaims)
+                
                 return e.JSON(http.StatusOK, map[string]interface{}{
-                    "pb_user_id": claims["sub"],
-                    "email":      claims["email"],
-                    "authed":     true,
+                    "authed": true,
+                    "user": map[string]interface{}{
+                        "pb_id":           pbUser.Id,
+                        "supabase_id":     claims["sub"],
+                        "email":           claims["email"],
+                        "username":        pbUser.GetString("username"),
+                        "verified":        pbUser.GetBool("verified"),
+                        "emailVisibility": pbUser.GetBool("emailVisibility"),
+                    },
+                    "claims": map[string]interface{}{
+                        "aud":    claims["aud"],
+                        "exp":    claims["exp"],
+                        "iat":    claims["iat"],
+                        "iss":    claims["iss"],
+                        "sub":    claims["sub"],
+                        "email":  claims["email"],
+                        "role":   claims["role"],
+                    },
                 })
             }
-            return e.JSON(http.StatusOK, map[string]interface{}{"authed": false})
+
+            return e.JSON(http.StatusOK, map[string]interface{}{
+                "authed": false,
+                "message": "No authentication found",
+            })
         })
 
         // register a global middleware
@@ -175,4 +201,50 @@ func main() {
     if err := app.Start(); err != nil {
         log.Fatal(err)
     }
+}
+
+// handleSupabaseAuth handles the /auth/supabase endpoint using middleware data
+func handleSupabaseAuth(e *core.RequestEvent, app *pocketbase.PocketBase) error {
+    // Check if user is authenticated via middleware
+    authed := e.Get("authed")
+    if authed == nil || !authed.(bool) {
+        return e.JSON(http.StatusUnauthorized, map[string]interface{}{
+            "error": "authentication required - no valid Supabase session found",
+        })
+    }
+
+    // Get JWT claims and PB user from middleware
+    claims, ok := e.Get("pb_auth_claims").(jwt.MapClaims)
+    if !ok {
+        return e.JSON(http.StatusUnauthorized, map[string]interface{}{
+            "error": "invalid claims",
+        })
+    }
+
+    pbUser, ok := e.Get("pb_auth_record").(*core.Record)
+    if !ok {
+        return e.JSON(http.StatusInternalServerError, map[string]interface{}{
+            "error": "failed to get user record",
+        })
+    }
+
+    // Return response with PocketBase token and user info
+    return e.JSON(http.StatusOK, map[string]interface{}{
+        "record": map[string]interface{}{
+            "id":              pbUser.Id,
+            "email":           pbUser.Email(),
+            "username":        pbUser.GetString("username"),
+            "verified":        pbUser.GetBool("verified"),
+            "emailVisibility": pbUser.GetBool("emailVisibility"),
+            "user_id":         pbUser.GetString("user_id"), // Supabase ID
+        },
+        "supabase_claims": map[string]interface{}{
+            "user_id": claims["sub"],
+            "email":   claims["email"],
+            "aud":     claims["aud"],
+            "exp":     claims["exp"],
+            "iss":     claims["iss"],
+        },
+        "success": true,
+    })
 }

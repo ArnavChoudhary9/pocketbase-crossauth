@@ -42,6 +42,7 @@ func getPBUser(app *pocketbase.PocketBase, userID string, email string) (*core.R
     user.Set("username", username)
     user.Set("password", password)
     user.Set("user_id", userID)        // Set user_id to Supabase ID
+    
     user.Set("verified", true)         // Set email as verified
     user.Set("emailVisibility", true)  // Make email visible (optional)
 
