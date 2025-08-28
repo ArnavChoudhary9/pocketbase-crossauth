@@ -66,7 +66,7 @@ func fetchJWKS(jwksUrl string) (*JWKS, error) {
     if jwksCache.keys != nil && time.Now().Before(jwksCache.expiresAt) {
         keys := jwksCache.keys
         jwksCache.mutex.RUnlock()
-        log.Printf("Using cached JWKS keys")
+        // log.Printf("Using cached JWKS keys")
         return keys, nil
     }
     jwksCache.mutex.RUnlock()
@@ -76,11 +76,11 @@ func fetchJWKS(jwksUrl string) (*JWKS, error) {
 
     // Double-check after acquiring write lock
     if jwksCache.keys != nil && time.Now().Before(jwksCache.expiresAt) {
-        log.Printf("Using cached JWKS keys (double-check)")
+        // log.Printf("Using cached JWKS keys (double-check)")
         return jwksCache.keys, nil
     }
 
-    log.Printf("Fetching JWKS from: %s", jwksUrl)
+    // log.Printf("Fetching JWKS from: %s", jwksUrl)
     
     client := &http.Client{
         Timeout: 10 * time.Second,
@@ -227,16 +227,4 @@ func refreshAccessToken(refreshToken, supabaseProjectId, supabaseAnonKey string)
     }
     
     return &refreshResp, nil
-}
-
-// getUserClaims retrieves the user claims from PocketBase
-func getUserClaims(supabaseId, email string) (jwt.MapClaims, error) {
-    log.Printf("Would get user with Supabase ID: %s, Email: %s", supabaseId, email)
-
-    // Return mock claims for now
-    return jwt.MapClaims{
-        "sub":   supabaseId,
-        "email": email,
-        "id":    supabaseId, // Use supabase ID as PB ID for now
-    }, nil
 }

@@ -82,7 +82,7 @@ func main() {
                     continue
                 }
                 if matched {
-                    log.Printf("Skipping auth for excluded path: %s (pattern: %s)", p, pattern)
+                    // log.Printf("Skipping auth for excluded path: %s (pattern: %s)", p, pattern)
                     return e.Next()
                 }
             }
@@ -134,7 +134,7 @@ func main() {
                 
                 // Check if we have a refresh token to try refreshing
                 if refreshToken, ok := tokenData["refresh_token"].(string); ok && refreshToken != "" {
-                    log.Printf("Attempting to refresh access token...")
+                    // log.Printf("Attempting to refresh access token...")
                     
                     refreshResp, refreshErr := refreshAccessToken(refreshToken, config.SupabaseProjectID, config.SupabaseAnonKey)
                     if refreshErr != nil {
@@ -160,7 +160,7 @@ func main() {
                         return e.UnauthorizedError("Invalid refreshed token", nil)
                     }
                     
-                    log.Printf("Successfully refreshed and verified token")
+                    // log.Printf("Successfully refreshed and verified token")
                 } else {
                     return e.UnauthorizedError("Invalid token and no refresh token available", nil)
                 }
@@ -180,9 +180,9 @@ func main() {
                 return e.InternalServerError("Failed to get user", nil)
             }
 
-            log.Printf("Token verified successfully!")
-            log.Printf("User ID: %v", claims["sub"])
-            log.Printf("Email: %v", claims["email"])
+            // log.Printf("Token verified successfully!")
+            // log.Printf("User ID: %v", claims["sub"])
+            // log.Printf("Email: %v", claims["email"])
 
             // Set PocketBase auth context with claims
             e.Set("pb_auth_record", pbUser)       // Store user claims
